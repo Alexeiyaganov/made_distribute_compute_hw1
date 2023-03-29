@@ -1,125 +1,69 @@
 
 package org.apache.spark.ml.made
 
-import com.google.common.io.Files
-import org.apache.spark.ml.linalg.{Vector, Vectors}
-import org.apache.spark.ml.{Pipeline, PipelineModel}
-import org.apache.spark.sql.DataFrame
-import org.scalatest.flatspec._
-import org.scalatest.matchers._
+import org.apache.spark.ml.linalg.{DenseVector, Vector, VectorUDT, Vectors}
+import org.apache.spark.ml.param.ParamMap
+import org.apache.spark.ml.param.shared.{HasInputCol, HasOutputCol}
+import org.apache.spark.ml.stat.Summarizer
+import org.apache.spark.ml.util.{DefaultParamsReadable, DefaultParamsWritable, Identifiable, SchemaUtils}
+import org.apache.spark.ml.{Estimator, Model}
+import org.apache.spark.sql.{DataFrame, Dataset, Encoder, Row}
+import org.apache.spark.sql.types.StructType
 
-class LinearRegressionTest extends AnyFlatSpec with should.Matchers with WithSpark {
-  val delta = 0.0001
-  lazy val data: DataFrame = LinearRegressionTest._data
-  lazy val points: DataFrame = LinearRegressionTest._points
-  lazy val labels: Seq[Double] = LinearRegressionTest._labels
-  lazy val vectors: Seq[Vector] = LinearRegressionTest._vectors
+trait StandardScalerParams extends HasInputCol with HasOutputCol {
+  def setInputCol(value: String) : this.type = set(inputCol, value)
+  def setOutputCol(value: String): this.type = set(outputCol, value)
 
-  "Model" should "predict" in {
-    //    System.setProperty("hadoop.home.dir", "D:\\Program Files\\winutils-master\\hadoop-3.0.0");
+  protected def validateAndTransformSchema(schema: StructType): StructType = {
+    SchemaUtils.checkColumnType(schema, getInputCol, new VectorUDT())
 
-    val model = new LinearRegressionModel(Vectors.dense(1.0, 2.0), 1.0)
-      .setFeaturesCol("features")
-
-    val result: Array[Double] = model.transform(points).collect().map(_.getAs[Double](model.getPredictionCol))
-
-    result(0) should be(labels(0))
-    result(1) should be(labels(1))
-    result(2) should be(labels(2))
-    result(3) should be(labels(3))
-  }
-
-  "Estimator" should "calculate regression" in {
-    val estimator = constructDefaultRegression()
-
-    val model = estimator.fit(data)
-
-    validateModelParams(model)
-  }
-
-  "Estimator" should "should produce functional model" in {
-    val estimator = constructDefaultRegression()
-
-    val model = estimator.fit(data)
-
-    validateModel(model, model.transform(data))
-  }
-
-  "Estimator" should "work after re-read" in {
-    val pipeline = new Pipeline().setStages(Array(constructDefaultRegression()))
-
-    val tmpFolder = Files.createTempDir()
-    pipeline.write.overwrite().save(tmpFolder.getAbsolutePath)
-
-    val reRead = Pipeline.load(tmpFolder.getAbsolutePath)
-    val model = reRead.fit(data).stages(0).asInstanceOf[LinearRegressionModel]
-
-    validateModelParams(model)
-    validateModel(model, model.transform(data))
-  }
-
-  "Model" should "work after re-read" in {
-    val pipeline = new Pipeline().setStages(Array(constructDefaultRegression()))
-    val model = pipeline.fit(data)
-
-    val tmpFolder = Files.createTempDir()
-    model.write.overwrite().save(tmpFolder.getAbsolutePath)
-
-    val reRead: PipelineModel = PipelineModel.load(tmpFolder.getAbsolutePath)
-
-    val reReadModel = model.stages(0).asInstanceOf[LinearRegressionModel]
-    validateModelParams(reReadModel)
-    validateModel(reReadModel, reRead.transform(data))
-  }
-
-  private def validateModelParams(model: LinearRegressionModel) = {
-    model.coefficients(0) should be(1.0 +- delta)
-    model.coefficients(1) should be(2.0 +- delta)
-    model.b should be(1.0 +- delta)
-  }
-
-  private def validateModel(model: LinearRegressionModel, data: DataFrame) = {
-    val vectors: Array[Double] = data.collect().map(_.getAs[Double](2))
-
-    vectors.length should be(4)
-
-    vectors(0) should be(labels(0) +- delta)
-    vectors(1) should be(labels(1) +- delta)
-    vectors(2) should be(labels(2) +- delta)
-    vectors(3) should be(labels(3) +- delta)
-  }
-
-  private def constructDefaultRegression() = {
-    new LinearRegression()
-      .setFeaturesCol("features")
-      .setLabelCol("labels")
-      .setMaxIterCol(5000)
-      .setTolCol(0.000000001)
-      .setRegCol(0.0)
+    if (schema.fieldNames.contains($(outputCol))) {
+      SchemaUtils.checkColumnType(schema, getOutputCol, new VectorUDT())
+      schema
+    } else {
+      SchemaUtils.appendColumn(schema, schema(getInputCol).copy(name = getOutputCol))
+    }
   }
 }
 
-object LinearRegressionTest extends WithSpark {
-  lazy val _vectors = Seq(
-    Vectors.dense(13.5, 12, 38.5),
-    Vectors.dense(-1.0, 0, 0),
-    Vectors.dense(20.0, 5, 31),
-    Vectors.dense(-10.0, 2, -5)
-  )
+class StandardScaler(override val uid: String) extends Estimator[StandardScalerModel] with StandardScalerParams
+  with DefaultParamsWritable {
 
-  lazy val _points: DataFrame = {
-    import sqlc.implicits._
-    _vectors.map(x => Tuple1(Vectors.dense(x(0), x(1))))
-      .toDF("features")
+  def this() = this(Identifiable.randomUID("standardScaler"))
+
+  override def fit(dataset: Dataset[_]): StandardScalerModel = {
+    val Row(Row(mean, std)) = dataset
+      .select(Summarizer.metrics("mean", "std").summary(dataset($(inputCol))))
+      .first()
+
+    copyValues(new StandardScalerModel(mean.asInstanceOf[Vector].toDense, std.asInstanceOf[Vector].toDense)).setParent(this)
   }
 
-  lazy val _labels: Seq[Double] = {
-    _vectors.map(x => x(2))
+  override def copy(extra: ParamMap): Estimator[StandardScalerModel] = ???
+
+  override def transformSchema(schema: StructType): StructType = validateAndTransformSchema(schema)
+}
+
+object StandardScaler extends DefaultParamsReadable[StandardScaler]
+
+class StandardScalerModel private[made](
+                                         override val uid: String,
+                                         val means: DenseVector,
+                                         val stds: DenseVector) extends Model[StandardScalerModel] with StandardScalerParams {
+
+  private[made] def this(means: DenseVector, stds: DenseVector) =
+    this(Identifiable.randomUID("standardScalerModel"), means, stds)
+
+  override def copy(extra: ParamMap): StandardScalerModel = ???
+
+  override def transform(dataset: Dataset[_]): DataFrame = {
+    val transformUdf = dataset.sqlContext.udf.register(uid + "_transform",
+      (x : Vector) => {
+        Vectors.fromBreeze((x.asBreeze - means.asBreeze) /:/ stds.asBreeze)
+      })
+
+    dataset.withColumn($(outputCol), transformUdf(dataset($(inputCol))))
   }
 
-  lazy val _data: DataFrame = {
-    import sqlc.implicits._
-    _vectors.map(x => Tuple2(Vectors.dense(x(0), x(1)), x(2)))
-      .toDF("features", "labels")
-  }
+  override def transformSchema(schema: StructType): StructType = validateAndTransformSchema(schema)
 }
